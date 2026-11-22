@@ -1,15 +1,16 @@
 """
-Interlinear PDF Translator - Telegram Bot (Cloud & Local Edition)
-- High-Speed Serverless & Background Telegram Bot Engine
-- Embedded HTTP Health-Check Server (Compatible with Hugging Face, Render, Koyeb, Railway)
-- Inline buttons for font size, medical term highlighting, and color customization
-- Automatic file download, processing with Turbo Parallel Translator, and instant reply
-- Clean file cleanup and robust error handling
+Interlinear PDF Translator - Telegram Bot (Full Control Edition)
+- Comprehensive User Settings: Font Size, Text Color, Medical Highlighting, Alignment
+- Persistent JSON Settings Storage (Per-user persistent configuration)
+- Visual Inline Buttons with Active Checkmarks (✅)
+- Integrated Cloud Health-Check Server (Port 7860/PORT)
+- High-Speed Turbo Parallel Translation Engine
 """
 
 import os
 import sys
 import time
+import json
 import shutil
 import tempfile
 import threading
@@ -18,18 +19,115 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from translator_core import PDFInterlinearTranslator
 
-# Read Bot Token from Environment variable or CLI
+# Bot Token from environment or CLI argument
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
-# User Settings Store (in-memory per chat_id)
-USER_SETTINGS = {}
+# Path for persistent user settings
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_settings.json")
+_settings_lock = threading.Lock()
 
-COLOR_OPTIONS = {
+
+def load_all_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_user_setting(user_id_str, settings_dict):
+    with _settings_lock:
+        all_s = load_all_settings()
+        all_s[user_id_str] = settings_dict
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(all_s, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+AVAILABLE_SIZES = [
+    ("auto", "تلقائي"),
+    ("4.5", "4.5"),
+    ("5.5", "5.5"),
+    ("6.5", "6.5"),
+    ("7.5", "7.5"),
+    ("8.5", "8.5"),
+    ("10.0", "10.0")
+]
+
+AVAILABLE_COLORS = {
     "blue": {"tuple": (0.08, 0.35, 0.78), "label": "🔵 أزرق ملكي"},
-    "black": {"tuple": (0.0, 0.0, 0.0), "label": "⚫ أسود"},
-    "slate": {"tuple": (0.22, 0.28, 0.35), "label": "🔘 كحلي هادئ"},
-    "red": {"tuple": (0.75, 0.12, 0.12), "label": "🔴 أحمر"}
+    "red": {"tuple": (0.75, 0.12, 0.12), "label": "🔴 أحمر طبي"},
+    "black": {"tuple": (0.0, 0.0, 0.0), "label": "⚫ أسود كلاسيكي"},
+    "green": {"tuple": (0.08, 0.55, 0.25), "label": "🟢 أخضر غامق"},
+    "slate": {"tuple": (0.22, 0.28, 0.35), "label": "🔘 كحلي هادئ"}
 }
+
+DEFAULT_USER_CONFIG = {
+    "font_size_str": "6.5",
+    "font_size": 6.5,
+    "color_key": "blue",
+    "color_tuple": (0.08, 0.35, 0.78),
+    "color_label": "🔵 أزرق ملكي",
+    "highlight_medical": True,
+    "alignment": "balanced_right"
+}
+
+
+def get_user_config(user_id):
+    uid_str = str(user_id)
+    all_s = load_all_settings()
+    if uid_str in all_s:
+        cfg = all_s[uid_str]
+        # Ensure complete fields
+        for k, v in DEFAULT_USER_CONFIG.items():
+            if k not in cfg:
+                cfg[k] = v
+        return cfg
+    return dict(DEFAULT_USER_CONFIG)
+
+
+def update_user_config(user_id, updates):
+    cfg = get_user_config(user_id)
+    cfg.update(updates)
+    save_user_setting(str(user_id), cfg)
+    return cfg
+
+
+def build_settings_keyboard(user_id):
+    cfg = get_user_config(user_id)
+    kb = InlineKeyboardMarkup(row_width=3)
+
+    # 1. Header: Font Size
+    kb.add(InlineKeyboardButton("── 📏 حجم الخط (Font Size) ──", callback_data="noop"))
+    size_btns = []
+    for s_val, s_label in AVAILABLE_SIZES:
+        is_active = (cfg["font_size_str"] == s_val)
+        btn_text = f"✅ {s_label}" if is_active else s_label
+        size_btns.append(InlineKeyboardButton(btn_text, callback_data=f"set_size:{s_val}"))
+    # Add in rows of 3 or 4
+    for i in range(0, len(size_btns), 4):
+        kb.row(*size_btns[i:i + 4])
+
+    # 2. Header: Color
+    kb.add(InlineKeyboardButton("── 🎨 لون الترجمة (Text Color) ──", callback_data="noop"))
+    col_btns = []
+    for c_key, c_info in AVAILABLE_COLORS.items():
+        is_active = (cfg["color_key"] == c_key)
+        btn_text = f"✅ {c_info['label']}" if is_active else c_info["label"]
+        col_btns.append(InlineKeyboardButton(btn_text, callback_data=f"set_color:{c_key}"))
+    kb.row(*col_btns[:2])
+    kb.row(*col_btns[2:4])
+    kb.row(*col_btns[4:])
+
+    # 3. Medical Highlighting Toggle
+    med_status = "🟢 مفعل (أخضر زمردي)" if cfg["highlight_medical"] else "⚪ معطل (نفس لون النص)"
+    kb.add(InlineKeyboardButton(f"🩺 تظليل المصطلحات الطبية: {med_status}", callback_data="toggle_med"))
+
+    return kb
 
 
 class HealthServerHandler(BaseHTTPRequestHandler):
@@ -41,7 +139,7 @@ class HealthServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Interlinear PDF Translator Telegram Bot is ONLINE 24/7!")
 
     def log_message(self, format, *args):
-        pass  # Quiet logging
+        pass
 
 
 def start_health_server():
@@ -51,42 +149,7 @@ def start_health_server():
         print(f"Health check HTTP server listening on port {port}")
         server.serve_forever()
     except Exception as e:
-        print(f"Health server warning: {e}")
-
-
-def get_user_settings(chat_id):
-    if chat_id not in USER_SETTINGS:
-        USER_SETTINGS[chat_id] = {
-            "font_size": 6.2,
-            "highlight_medical": True,
-            "color": (0.08, 0.35, 0.78),
-            "color_name": "أزرق ملكي"
-        }
-    return USER_SETTINGS[chat_id]
-
-
-def build_settings_keyboard(chat_id):
-    cfg = get_user_settings(chat_id)
-    kb = InlineKeyboardMarkup(row_width=2)
-
-    sz_btn = InlineKeyboardButton(
-        f"📏 حجم الخط: {cfg['font_size']} pt",
-        callback_data="toggle_size"
-    )
-    med_status = "🟢 مفعل" if cfg["highlight_medical"] else "⚪ معطل"
-    med_btn = InlineKeyboardButton(
-        f"🩺 تظليل المصطلحات الطبية: {med_status}",
-        callback_data="toggle_medical"
-    )
-    col_btn = InlineKeyboardButton(
-        f"🎨 اللون: {cfg['color_name']}",
-        callback_data="toggle_color"
-    )
-
-    kb.add(sz_btn)
-    kb.add(med_btn)
-    kb.add(col_btn)
-    return kb
+        print(f"Health server note: {e}")
 
 
 def create_bot(token=None):
@@ -100,64 +163,80 @@ def setup_handlers(bot):
 
     @bot.message_handler(commands=["start", "help"])
     def send_welcome(message):
-        chat_id = message.chat.id
+        user_id = message.from_user.id
+        cfg = get_user_config(user_id)
         welcome_text = (
-            "👋 <b>أهلاً بك في بوت الترجمة البينية الاحترافية لملفات الـ PDF!</b>\n\n"
+            "👋 <b>مرحباً بك في بوت الترجمة البينية لملفات الـ PDF!</b>\n\n"
             "✨ <b>مميزات البوت:</b>\n"
-            "• ترجمة بينية تضع المعنى العربي مباشرة فوق كل سطر إنجليزي.\n"
-            "• تظليل الكلمات والمصطلحات الطبية التخصصية حصراً بالأخضر الزمردي.\n"
-            "• معالجة تفرعية فائقة السرعة بدون إسقاط أي سطر.\n\n"
-            "⚙️ <b>إعداداتك الحالية أدناه، يمكنك تعديلها أو إرسال أي ملف PDF فوراً لبدء ترجمته:</b>"
+            "• ترجمة سطرية دقيقة تضع المعنى العربي مباشرة فوق كل سطر إنجليزي.\n"
+            "• تظليل الكلمات والمصطلحات الطبية حصراً باللون الأخضر الزمردي الهادئ.\n"
+            "• محاذاة متوازنة وتحكم فوري وكامل بحجم الخط ولون النص.\n\n"
+            f"⚙️ <b>إعداداتك المحفوظة حالياً:</b>\n"
+            f"• حجم الخط: <b>{cfg['font_size_str']} pt</b>\n"
+            f"• اللون: <b>{cfg['color_label']}</b>\n"
+            f"• التظليل الطبي: <b>{'🟢 مفعل' if cfg['highlight_medical'] else '⚪ معطل'}</b>\n\n"
+            "👇 <b>اضغط على الأزرار أدناه لتغيير الحجم أو اللون في أي وقت، أو أرسل ملف PDF للترجمة فوراً:</b>"
         )
         bot.send_message(
-            chat_id,
+            message.chat.id,
             welcome_text,
-            reply_markup=build_settings_keyboard(chat_id)
+            reply_markup=build_settings_keyboard(user_id)
         )
 
     @bot.message_handler(commands=["settings"])
     def show_settings(message):
-        chat_id = message.chat.id
+        user_id = message.from_user.id
         bot.send_message(
-            chat_id,
-            "⚙️ <b>لوحة التحكم بإعدادات الترجمة:</b>",
-            reply_markup=build_settings_keyboard(chat_id)
+            message.chat.id,
+            "⚙️ <b>لوحة التحكم بإعدادات الخط والألوان:</b>",
+            reply_markup=build_settings_keyboard(user_id)
         )
 
     @bot.callback_query_handler(func=lambda call: True)
     def handle_callback(call):
-        chat_id = call.message.chat.id
-        cfg = get_user_settings(chat_id)
+        user_id = call.from_user.id
+        data = call.data
 
-        if call.data == "toggle_size":
-            sizes = [5.0, 5.8, 6.2, 7.0, 8.0]
-            cur_idx = sizes.index(cfg["font_size"]) if cfg["font_size"] in sizes else 2
-            next_sz = sizes[(cur_idx + 1) % len(sizes)]
-            cfg["font_size"] = next_sz
-            bot.answer_callback_query(call.id, f"تم تغيير حجم الخط إلى: {next_sz} pt")
+        if data == "noop":
+            bot.answer_callback_query(call.id)
+            return
 
-        elif call.data == "toggle_medical":
-            cfg["highlight_medical"] = not cfg["highlight_medical"]
-            status_txt = "مفعل 🟢" if cfg["highlight_medical"] else "معطل ⚪"
-            bot.answer_callback_query(call.id, f"تظليل المصطلحات الطبية: {status_txt}")
+        cfg = get_user_config(user_id)
 
-        elif call.data == "toggle_color":
-            color_keys = list(COLOR_OPTIONS.keys())
-            cur_key = "blue"
-            for k, v in COLOR_OPTIONS.items():
-                if v["label"] == cfg["color_name"]:
-                    cur_key = k
-                    break
-            next_key = color_keys[(color_keys.index(cur_key) + 1) % len(color_keys)]
-            cfg["color"] = COLOR_OPTIONS[next_key]["tuple"]
-            cfg["color_name"] = COLOR_OPTIONS[next_key]["label"]
-            bot.answer_callback_query(call.id, f"تم تغيير اللون إلى: {cfg['color_name']}")
+        if data.startswith("set_size:"):
+            s_val = data.split(":", 1)[1]
+            real_size = None if s_val == "auto" else float(s_val)
+            update_user_config(user_id, {
+                "font_size_str": s_val,
+                "font_size": real_size
+            })
+            bot.answer_callback_query(call.id, f"✅ تم تثبيت حجم الخط: {s_val} pt")
 
-        bot.edit_message_reply_markup(
-            chat_id,
-            call.message.message_id,
-            reply_markup=build_settings_keyboard(chat_id)
-        )
+        elif data.startswith("set_color:"):
+            c_key = data.split(":", 1)[1]
+            if c_key in AVAILABLE_COLORS:
+                c_info = AVAILABLE_COLORS[c_key]
+                update_user_config(user_id, {
+                    "color_key": c_key,
+                    "color_tuple": c_info["tuple"],
+                    "color_label": c_info["label"]
+                })
+                bot.answer_callback_query(call.id, f"✅ تم تثبيت اللون: {c_info['label']}")
+
+        elif data == "toggle_med":
+            new_status = not cfg["highlight_medical"]
+            update_user_config(user_id, {"highlight_medical": new_status})
+            txt = "مفعل 🟢" if new_status else "معطل ⚪"
+            bot.answer_callback_query(call.id, f"تظليل المصطلحات الطبية: {txt}")
+
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=build_settings_keyboard(user_id)
+            )
+        except Exception:
+            pass
 
     @bot.message_handler(content_types=["document"])
     def handle_pdf(message):
@@ -166,13 +245,18 @@ def setup_handlers(bot):
             bot.reply_to(message, "⚠️ يرجى إرسال ملف بصيغة PDF فقط.")
             return
 
+        user_id = message.from_user.id
         chat_id = message.chat.id
-        cfg = get_user_settings(chat_id)
+        cfg = get_user_config(user_id)
+
+        sz_display = "تلقائي" if cfg["font_size"] is None else f"{cfg['font_size']} pt"
+        med_display = "🟢 مفعل" if cfg["highlight_medical"] else "⚪ معطل"
 
         status_msg = bot.reply_to(
             message,
-            f"📥 <b>جاري استلام الملف:</b> <code>{doc.file_name}</code>\n"
-            f"⚡ جاري تهيئة محرك الترجمة التفرعية الفائقة..."
+            f"📥 <b>تم استلام الملف:</b> <code>{doc.file_name}</code>\n"
+            f"⚙️ <b>الإعدادات المطبقة:</b> خط {sz_display} | {cfg['color_label']} | طبي {med_display}\n"
+            f"⚡ جاري المعالجة بالترجمة التفرعية الفائقة..."
         )
 
         tmp_dir = tempfile.mkdtemp(prefix="interlinear_bot_")
@@ -194,7 +278,7 @@ def setup_handlers(bot):
                     last_edit_time[0] = now
                     try:
                         bot.edit_message_text(
-                            f"⚙️ <b>جاري المعالجة:</b> <code>{doc.file_name}</code>\n"
+                            f"⚙️ <b>جاري ترجمة:</b> <code>{doc.file_name}</code>\n"
                             f"📄 الصفحة {cur} من {total}\n"
                             f"<i>{text}</i>",
                             chat_id,
@@ -203,12 +287,12 @@ def setup_handlers(bot):
                     except Exception:
                         pass
 
-            # 2. Translate with Turbo Parallel Translator
+            # 2. Run Translator with User Config
             translator = PDFInterlinearTranslator(
                 input_pdf_path=input_pdf_path,
                 output_pdf_path=output_pdf_path,
                 font_size=cfg["font_size"],
-                color=cfg["color"],
+                color=cfg["color_tuple"],
                 highlight_medical=cfg["highlight_medical"],
                 progress_callback=progress_callback
             )
@@ -223,7 +307,7 @@ def setup_handlers(bot):
                 f"• عدد الصفحات: {result.get('pages', 0)}\n"
                 f"• عدد الأسطر المترجمة: {result.get('lines', 0)}\n"
                 f"• وقت التنفيذ: {elapsed:.1f} ثانية ⚡\n"
-                f"• حجم الخط: {cfg['font_size']} pt | المصطلحات الطبية: {'🟢 مفعلة' if cfg['highlight_medical'] else '⚪ معطلة'}"
+                f"• حجم الخط: {sz_display} | اللون: {cfg['color_label']}"
             )
 
             with open(output_pdf_path, "rb") as out_file:
@@ -254,7 +338,6 @@ def main():
     if not token:
         print("Error: No bot token provided.")
         print("Usage: python bot.py <YOUR_TELEGRAM_BOT_TOKEN>")
-        print("Or set the environment variable TELEGRAM_BOT_TOKEN")
         sys.exit(1)
 
     # Start cloud health-check HTTP server in background thread
