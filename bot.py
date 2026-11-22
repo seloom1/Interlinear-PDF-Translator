@@ -1,6 +1,7 @@
 """
-Interlinear PDF Translator - Telegram Bot
+Interlinear PDF Translator - Telegram Bot (Cloud & Local Edition)
 - High-Speed Serverless & Background Telegram Bot Engine
+- Embedded HTTP Health-Check Server (Compatible with Hugging Face, Render, Koyeb, Railway)
 - Inline buttons for font size, medical term highlighting, and color customization
 - Automatic file download, processing with Turbo Parallel Translator, and instant reply
 - Clean file cleanup and robust error handling
@@ -11,15 +12,16 @@ import sys
 import time
 import shutil
 import tempfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from translator_core import PDFInterlinearTranslator
 
-# Read Bot Token from Environment variable or config
+# Read Bot Token from Environment variable or CLI
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
 # User Settings Store (in-memory per chat_id)
-# {chat_id: {"font_size": 6.2, "highlight_medical": True, "color": (0.08, 0.35, 0.78), "color_name": "أزرق ملكي"}}
 USER_SETTINGS = {}
 
 COLOR_OPTIONS = {
@@ -28,6 +30,28 @@ COLOR_OPTIONS = {
     "slate": {"tuple": (0.22, 0.28, 0.35), "label": "🔘 كحلي هادئ"},
     "red": {"tuple": (0.75, 0.12, 0.12), "label": "🔴 أحمر"}
 }
+
+
+class HealthServerHandler(BaseHTTPRequestHandler):
+    """Responds to cloud container health checks (Render, Hugging Face, etc.)"""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Interlinear PDF Translator Telegram Bot is ONLINE 24/7!")
+
+    def log_message(self, format, *args):
+        pass  # Quiet logging
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", 7860)))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthServerHandler)
+        print(f"Health check HTTP server listening on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Health server warning: {e}")
 
 
 def get_user_settings(chat_id):
@@ -45,18 +69,15 @@ def build_settings_keyboard(chat_id):
     cfg = get_user_settings(chat_id)
     kb = InlineKeyboardMarkup(row_width=2)
 
-    # Font size button
     sz_btn = InlineKeyboardButton(
         f"📏 حجم الخط: {cfg['font_size']} pt",
         callback_data="toggle_size"
     )
-    # Medical highlight button
     med_status = "🟢 مفعل" if cfg["highlight_medical"] else "⚪ معطل"
     med_btn = InlineKeyboardButton(
         f"🩺 تظليل المصطلحات الطبية: {med_status}",
         callback_data="toggle_medical"
     )
-    # Color button
     col_btn = InlineKeyboardButton(
         f"🎨 اللون: {cfg['color_name']}",
         callback_data="toggle_color"
@@ -71,7 +92,7 @@ def build_settings_keyboard(chat_id):
 def create_bot(token=None):
     tok = token or BOT_TOKEN
     if not tok:
-        raise ValueError("TELEGRAM_BOT_TOKEN is not set. Please set the environment variable or pass the token.")
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
     return telebot.TeleBot(tok, parse_mode="HTML")
 
 
@@ -169,7 +190,6 @@ def setup_handlers(bot):
 
             def progress_callback(cur, total, text):
                 now = time.time()
-                # Update status at most once every 2 seconds to avoid Telegram rate limits
                 if now - last_edit_time[0] > 2.0 or cur == total:
                     last_edit_time[0] = now
                     try:
@@ -214,7 +234,6 @@ def setup_handlers(bot):
                     reply_to_message_id=message.message_id
                 )
 
-            # Delete the status message
             try:
                 bot.delete_message(chat_id, status_msg.message_id)
             except Exception:
@@ -237,6 +256,10 @@ def main():
         print("Usage: python bot.py <YOUR_TELEGRAM_BOT_TOKEN>")
         print("Or set the environment variable TELEGRAM_BOT_TOKEN")
         sys.exit(1)
+
+    # Start cloud health-check HTTP server in background thread
+    t = threading.Thread(target=start_health_server, daemon=True)
+    t.start()
 
     bot = create_bot(token)
     setup_handlers(bot)
